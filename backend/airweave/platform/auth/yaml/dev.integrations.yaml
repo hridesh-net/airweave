@@ -214,5 +214,18 @@ integrations:
       access_type: "offline"
       prompt: "consent"
 
+  discord:
+    auth_type: "oauth2_with_refresh"
+    url: "https://discord.com/api/oauth2/authorize"
+    backend_url: "https://discord.com/api/oauth2/token"
+    grant_type: "authorization_code"
+    client_id: "1358885268429606982"
+    client_secret: "Pyu1bBKd3i_akEPsTopH2hzXQMJjA2a3"
+    content_type: "application/x-www-form-urlencoded"
+    client_credential_location: "body"
+    scope: "identify guilds guilds.members.read messages.read"
+    additional_frontend_params:
+      response_mode: "query"
+
   weaviate:
     auth_type: "config_class"
