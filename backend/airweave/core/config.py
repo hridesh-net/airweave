@@ -74,6 +74,9 @@ class Settings(BaseSettings):
 
     OPENAI_API_KEY: Optional[str] = None
     MISTRAL_API_KEY: Optional[str] = None
+    
+    LLM_PROVIDER: str = "openai"
+    OLLAMA_BASE_URL: Optional[str] = None
 
     @field_validator("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "AUTH0_RULE_NAMESPACE", mode="before")
     def validate_auth0_settings(cls, v: str, info: ValidationInfo) -> str:
