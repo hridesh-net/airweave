@@ -125,7 +125,7 @@ class TestConnectionService:
         integration_type = IntegrationType.SOURCE
         short_name = "test_source"
         name = "Test Connection"
-        config_fields = {}
+        auth_fields = {}
 
         mock_integration = MagicMock()
         mock_integration.auth_type = AuthType.none
@@ -140,7 +140,7 @@ class TestConnectionService:
 
         # Act
         result = await connection_service.connect_with_config(
-            mock_db, integration_type, short_name, name, config_fields, mock_user
+            mock_db, integration_type, short_name, name, auth_fields, mock_user
         )
 
         # Assert
@@ -173,7 +173,7 @@ class TestConnectionService:
         integration_type = IntegrationType.SOURCE
         short_name = "test_source"
         name = "Test Connection"
-        config_fields = {"api_key": "test_key"}
+        auth_fields = {"api_key": "test_key"}
 
         mock_integration = MagicMock()
         mock_integration.auth_type = AuthType.config_class
@@ -198,7 +198,7 @@ class TestConnectionService:
 
         # Act
         result = await connection_service.connect_with_config(
-            mock_db, integration_type, short_name, name, config_fields, mock_user
+            mock_db, integration_type, short_name, name, auth_fields, mock_user
         )
 
         # Assert
@@ -206,7 +206,7 @@ class TestConnectionService:
             mock_uow.session, integration_type, short_name
         )
         mock_locator.get_auth_config.assert_called_once_with("TestAuthConfig")
-        mock_auth_config_class.assert_called_once_with(**config_fields)
+        mock_auth_config_class.assert_called_once_with(**auth_fields)
         mock_credentials.encrypt.assert_called_once_with(mock_auth_config.model_dump())
 
         connection_service._create_connection_with_credential.assert_called_once_with(
@@ -236,14 +236,14 @@ class TestConnectionService:
         integration_type = IntegrationType.SOURCE
         short_name = "non_existent"
         name = "Test Connection"
-        config_fields = {}
+        auth_fields = {}
 
         connection_service._get_integration_by_type = AsyncMock(return_value=None)
 
         # Act & Assert
         with pytest.raises(HTTPException) as excinfo:
             await connection_service.connect_with_config(
-                mock_db, integration_type, short_name, name, config_fields, mock_user
+                mock_db, integration_type, short_name, name, auth_fields, mock_user
             )
 
         assert excinfo.value.status_code == 400
@@ -259,7 +259,7 @@ class TestConnectionService:
         short_name = "test_source"
         mock_settings = MagicMock()
         mock_settings.auth_type = AuthType.oauth2
-        mock_integration_settings.get_by_short_name.return_value = mock_settings
+        mock_await integration_settings.get_by_short_name.return_value = mock_settings
 
         expected_url = "https://example.com/oauth2/authorize"
         mock_oauth2_service.generate_auth_url.return_value = expected_url
@@ -268,15 +268,15 @@ class TestConnectionService:
         result = await connection_service.get_oauth2_auth_url(short_name)
 
         # Assert
-        mock_integration_settings.get_by_short_name.assert_called_once_with(short_name)
-        mock_oauth2_service.generate_auth_url.assert_called_once_with(mock_settings)
+        mock_await integration_settings.get_by_short_name.assert_called_once_with(short_name)
+        mock_oauth2_service.generate_auth_url.assert_called_once_with(mock_settings, None)
         assert result == expected_url
 
     @patch("airweave.core.connection_service.integration_settings")
     async def test_get_oauth2_auth_url_integration_not_found(self, mock_integration_settings):
         # Arrange
         short_name = "non_existent"
-        mock_integration_settings.get_by_short_name.return_value = None
+        mock_await integration_settings.get_by_short_name.return_value = None
 
         # Act & Assert
         with pytest.raises(HTTPException) as excinfo:
@@ -307,7 +307,7 @@ class TestConnectionService:
         crud.source.get_by_short_name = AsyncMock(return_value=mock_source)
 
         mock_settings = MagicMock()
-        mock_integration_settings.get_by_short_name.return_value = mock_settings
+        mock_await integration_settings.get_by_short_name.return_value = mock_settings
 
         mock_connection = MagicMock(spec=schemas.Connection)
         connection_service._create_oauth2_connection = AsyncMock(return_value=mock_connection)
@@ -319,16 +319,18 @@ class TestConnectionService:
 
         # Assert
         mock_oauth2_service.exchange_autorization_code_for_token.assert_called_once_with(
-            short_name, code
+            short_name, code, None
         )
         crud.source.get_by_short_name.assert_called_once_with(mock_db, short_name)
-        mock_integration_settings.get_by_short_name.assert_called_once_with(short_name)
+        mock_await integration_settings.get_by_short_name.assert_called_once_with(short_name)
         connection_service._create_oauth2_connection.assert_called_once_with(
             db=mock_db,
             source=mock_source,
             settings=mock_settings,
             oauth2_response=oauth2_response,
             user=mock_user,
+            connection_name=None,
+            auth_fields=None
         )
         assert result == mock_connection
 

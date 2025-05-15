@@ -10,9 +10,10 @@ from airweave import crud, schemas
 from airweave.core import credentials
 from airweave.core.config import settings
 from airweave.core.exceptions import NotFoundException
+from airweave.core.logging import LoggerConfigurator, _ContextualLogger
 from airweave.platform.auth.schemas import AuthType
 from airweave.platform.auth.services import oauth2_service
-from airweave.platform.destinations._base import BaseDestination, VectorDBDestination
+from airweave.platform.destinations._base import BaseDestination
 from airweave.platform.embedding_models._base import BaseEmbeddingModel
 from airweave.platform.embedding_models.local_text2vec import LocalText2Vec
 from airweave.platform.embedding_models.openai_text2vec import OpenAIText2Vec
@@ -36,7 +37,10 @@ class SyncContext:
     - dag - the DAG that is created for the sync
     - progress - the progress tracker, interfaces with PubSub
     - router - the DAG router
+    - collection - the collection that the sync is for
+    - source connection - the source connection that the sync is for
     - white label (optional)
+    - logger - contextual logger with sync job metadata
     """
 
     source: BaseSource
@@ -48,8 +52,11 @@ class SyncContext:
     dag: schemas.SyncDag
     progress: SyncProgress
     router: SyncDAGRouter
+    collection: schemas.Collection
+    source_connection: schemas.Connection
     entity_map: dict[type[BaseEntity], UUID]
     current_user: schemas.User
+    logger: _ContextualLogger
 
     white_label: Optional[schemas.WhiteLabel] = None
 
@@ -64,8 +71,11 @@ class SyncContext:
         dag: schemas.SyncDag,
         progress: SyncProgress,
         router: SyncDAGRouter,
+        collection: schemas.Collection,
+        source_connection: schemas.Connection,
         entity_map: dict[type[BaseEntity], UUID],
         current_user: schemas.User,
+        logger: _ContextualLogger,
         white_label: Optional[schemas.WhiteLabel] = None,
     ):
         """Initialize the sync context."""
@@ -78,9 +88,12 @@ class SyncContext:
         self.dag = dag
         self.progress = progress
         self.router = router
+        self.collection = collection
+        self.source_connection = source_connection
         self.entity_map = entity_map
         self.current_user = current_user
         self.white_label = white_label
+        self.logger = logger
 
 
 class SyncContextFactory:
@@ -93,20 +106,44 @@ class SyncContextFactory:
         sync: schemas.Sync,
         sync_job: schemas.SyncJob,
         dag: schemas.SyncDag,
+        collection: schemas.Collection,
+        source_connection: schemas.Connection,
         current_user: schemas.User,
-        white_label: Optional[schemas.WhiteLabel] = None,
     ) -> SyncContext:
         """Create a sync context."""
-        source = await cls._create_source_instance(db=db, sync=sync, current_user=current_user)
+        # Fetch white label if set in sync
+        white_label = None
+        if sync.white_label_id:
+            white_label = await crud.white_label.get(
+                db, id=sync.white_label_id, current_user=current_user
+            )
+
+        source = await cls._create_source_instance(
+            db=db, sync=sync, current_user=current_user, white_label=white_label
+        )
         embedding_model = cls._get_embedding_model(sync=sync)
         destinations = await cls._create_destination_instances(
-            db=db, sync=sync, current_user=current_user, embedding_model=embedding_model
+            db=db,
+            sync=sync,
+            collection=collection,
+            current_user=current_user,
         )
         transformers = await cls._get_transformer_callables(db=db, sync=sync)
         entity_map = await cls._get_entity_definition_map(db=db)
 
         progress = SyncProgress(sync_job.id)
         router = SyncDAGRouter(dag, entity_map)
+
+        # Create a contextualized logger with sync job metadata
+        logger = LoggerConfigurator.configure_logger(
+            "airweave.platform.sync",
+            dimensions={
+                "sync_id": str(sync.id),
+                "sync_job_id": str(sync_job.id),
+                "user_id": str(current_user.id),
+                # "org_id": str(sync.organization_id), TODO: add org id when we have orgs
+            },
+        )
 
         return SyncContext(
             source=source,
@@ -116,10 +153,13 @@ class SyncContextFactory:
             sync=sync,
             sync_job=sync_job,
             dag=dag,
+            collection=collection,
+            source_connection=source_connection,
             progress=progress,
             router=router,
             entity_map=entity_map,
             current_user=current_user,
+            logger=logger,
             white_label=white_label,
         )
 
@@ -129,6 +169,7 @@ class SyncContextFactory:
         db: AsyncSession,
         sync: schemas.Sync,
         current_user: schemas.User,
+        white_label: Optional[schemas.WhiteLabel] = None,
     ) -> BaseSource:
         """Create and configure the source instance based on authentication type."""
         source_connection = await crud.connection.get(db, sync.source_connection_id, current_user)
@@ -137,7 +178,7 @@ class SyncContextFactory:
 
         source_model = await crud.source.get_by_short_name(db, source_connection.short_name)
         if not source_model:
-            raise NotFoundException("Source not found")
+            raise NotFoundException(f"Source not found: {source_connection.short_name}")
 
         source_class = resource_locator.get_source(source_model)
 
@@ -149,7 +190,7 @@ class SyncContextFactory:
             AuthType.oauth2_with_refresh_rotating,
         ]:
             return await cls._create_oauth2_with_refresh_source(
-                db, source_model, source_class, current_user, source_connection
+                db, source_model, source_class, current_user, source_connection, white_label
             )
 
         if source_model.auth_type == AuthType.oauth2:
@@ -169,10 +210,19 @@ class SyncContextFactory:
         source_class,
         current_user: schemas.User,
         source_connection: schemas.Connection,
+        white_label: Optional[schemas.WhiteLabel] = None,
     ) -> BaseSource:
         """Create source instance for OAuth2 with refresh token."""
+        credential = await cls._get_integration_credential(db, source_connection, current_user)
+        decrypted_credential = credentials.decrypt(credential.encrypted_credentials)
+
         oauth2_response = await oauth2_service.refresh_access_token(
-            db, source_model.short_name, current_user, source_connection.id
+            db,
+            source_model.short_name,
+            current_user,
+            source_connection.id,
+            decrypted_credential,
+            white_label,
         )
         return await source_class.create(oauth2_response.access_token)
 
@@ -258,8 +308,8 @@ class SyncContextFactory:
         cls,
         db: AsyncSession,
         sync: schemas.Sync,
+        collection: schemas.Collection,
         current_user: schemas.User,
-        embedding_model: BaseEmbeddingModel,
     ) -> list[BaseDestination]:
         """Create destination instances.
 
@@ -267,46 +317,38 @@ class SyncContextFactory:
         -----
             db (AsyncSession): The database session
             sync (schemas.Sync): The sync object
+            collection (schemas.Collection): The collection object
             current_user (schemas.User): The current user
-            embedding_model (BaseEmbeddingModel): The embedding model to use for vector destinations
 
         Returns:
         --------
             list[BaseDestination]: A list of destination instances
         """
-        destinations = []
+        destination_connection_id = sync.destination_connection_ids[0]
 
-        for destination_connection_id in sync.destination_connection_ids:
-            destination_connection = await crud.connection.get(
-                db, destination_connection_id, current_user
+        destination_connection = await crud.connection.get(
+            db, destination_connection_id, current_user
+        )
+        if not destination_connection:
+            raise NotFoundException(
+                (
+                    f"Destination connection not found for user {current_user.email}"
+                    f" and connection id {destination_connection_id}"
+                )
             )
-            if not destination_connection:
-                raise NotFoundException(
-                    (
-                        f"Destination connection not found for user {current_user.email}"
-                        f" and connection id {destination_connection_id}"
-                    )
-                )
-            destination_model = await crud.destination.get_by_short_name(
-                db, destination_connection.short_name
+        destination_model = await crud.destination.get_by_short_name(
+            db, destination_connection.short_name
+        )
+        destination_schema = schemas.Destination.model_validate(destination_model)
+        if not destination_model:
+            raise NotFoundException(
+                f"Destination not found for connection {destination_connection.short_name}"
             )
-            destination_schema = schemas.Destination.model_validate(destination_model)
-            if not destination_model:
-                raise NotFoundException(
-                    f"Destination not found for connection {destination_connection.short_name}"
-                )
 
-            destination_class = resource_locator.get_destination(destination_schema)
-            if issubclass(destination_class, VectorDBDestination):
-                destination = await destination_class.create(
-                    sync_id=sync.id, vector_size=embedding_model.vector_dimensions
-                )
-            else:
-                destination = await destination_class.create(sync_id=sync.id)
+        destination_class = resource_locator.get_destination(destination_schema)
+        destination = await destination_class.create(collection_id=collection.id)
 
-            destinations.append(destination)
-
-        return destinations
+        return [destination]
 
     @classmethod
     async def _get_transformer_callables(

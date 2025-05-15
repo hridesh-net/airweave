@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as rest
 
 from airweave.core.config import settings
@@ -25,31 +25,26 @@ class QdrantDestination(VectorDBDestination):
     def __init__(self):
         """Initialize Qdrant destination."""
         self.collection_name: str | None = None
-        self.sync_id: UUID | None = None
+        self.collection_id: UUID | None = None
         self.url: str | None = None
         self.api_key: str | None = None
-        self.client: QdrantClient | None = None
+        self.client: AsyncQdrantClient | None = None
         self.vector_size: int = 384  # Default vector size
 
     @classmethod
-    async def create(
-        cls,
-        sync_id: UUID,
-        vector_size: int = 384,
-    ) -> "QdrantDestination":
+    async def create(cls, collection_id: UUID) -> "QdrantDestination":
         """Create a new Qdrant destination.
 
         Args:
-            sync_id (UUID): The ID of the sync.
+            collection_id (UUID): The ID of the collection.
             vector_size (int): The size of the vectors to use.
 
         Returns:
             QdrantDestination: The created destination.
         """
         instance = cls()
-        instance.sync_id = sync_id
-        instance.collection_name = f"Entities_{instance._sanitize_collection_name(sync_id)}"
-        instance.vector_size = vector_size
+        instance.collection_id = collection_id
+        instance.collection_name = str(collection_id)
 
         # Get credentials for sync_id
         credentials = await cls.get_credentials()
@@ -63,8 +58,6 @@ class QdrantDestination(VectorDBDestination):
         # Initialize client
         await instance.connect_to_qdrant()
 
-        # Set up initial collection
-        await instance.setup_collection(sync_id)
         return instance
 
     @classmethod
@@ -102,10 +95,10 @@ class QdrantDestination(VectorDBDestination):
                     client_config["api_key"] = api_key
 
                 # Initialize client
-                self.client = QdrantClient(**client_config)
+                self.client = AsyncQdrantClient(**client_config)
 
                 # Test connection
-                self.client.get_collections()
+                await self.client.get_collections()
                 logger.info("Successfully connected to Qdrant service.")
             except Exception as e:
                 logger.error(f"Error connecting to Qdrant service: {e}")
@@ -139,17 +132,18 @@ class QdrantDestination(VectorDBDestination):
         """
         await self.ensure_client_readiness()
         try:
-            collections = self.client.get_collections().collections
+            collections_response = await self.client.get_collections()
+            collections = collections_response.collections
             return any(collection.name == collection_name for collection in collections)
         except Exception as e:
             logger.error(f"Error checking if collection exists: {e}")
             return False
 
-    async def setup_collection(self, sync_id: UUID) -> None:  # noqa: C901
+    async def setup_collection(self, vector_size: int) -> None:  # noqa: C901
         """Set up the Qdrant collection for storing entities.
 
         Args:
-            sync_id (UUID): The ID of the sync.
+            vector_size (int): The size of the vectors to use.
         """
         await self.ensure_client_readiness()
 
@@ -162,10 +156,10 @@ class QdrantDestination(VectorDBDestination):
             logger.info(f"Creating collection {self.collection_name}...")
 
             # Create the collection
-            self.client.create_collection(
+            await self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=rest.VectorParams(
-                    size=self.vector_size,
+                    size=vector_size if vector_size else self.vector_size,
                     distance=rest.Distance.COSINE,
                 ),
                 optimizers_config=rest.OptimizersConfigDiff(
@@ -194,7 +188,7 @@ class QdrantDestination(VectorDBDestination):
             raise ValueError(f"Entity {entity.entity_id} has no vector")
 
         # Insert point with vector from entity
-        self.client.upsert(
+        await self.client.upsert(
             collection_name=self.collection_name,
             points=[
                 rest.PointStruct(
@@ -241,7 +235,7 @@ class QdrantDestination(VectorDBDestination):
             return
 
         # Bulk upsert
-        operation_response = self.client.upsert(
+        operation_response = await self.client.upsert(
             collection_name=self.collection_name,
             points=point_structs,
             wait=True,  # Wait for operation to complete
@@ -258,7 +252,7 @@ class QdrantDestination(VectorDBDestination):
         """
         await self.ensure_client_readiness()
 
-        self.client.delete(
+        await self.client.delete(
             collection_name=self.collection_name,
             points_selector=rest.PointIdsList(
                 points=[str(db_entity_id)],
@@ -266,21 +260,47 @@ class QdrantDestination(VectorDBDestination):
             wait=True,  # Wait for operation to complete
         )
 
-    async def bulk_delete(self, entity_ids: list[str]) -> None:
+    async def delete_by_sync_id(self, sync_id: UUID) -> None:
+        """Delete entities from the destination by sync ID."""
+        await self.ensure_client_readiness()
+
+        await self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=rest.FilterSelector(
+                filter=rest.Filter(
+                    should=[
+                        rest.FieldCondition(
+                            key="sync_id", match=rest.MatchValue(value=str(sync_id))
+                        )
+                    ]
+                )
+            ),
+            wait=True,  # Wait for operation to complete
+        )
+
+    async def bulk_delete(self, entity_ids: list[str], sync_id: UUID) -> None:
         """Bulk delete entities from Qdrant.
 
         Args:
             entity_ids (list[str]): The IDs of the entities to delete.
+            sync_id (UUID): The sync ID.
         """
         if not entity_ids:
             return
 
         await self.ensure_client_readiness()
 
-        self.client.delete(
+        await self.client.delete(
             collection_name=self.collection_name,
-            points_selector=rest.PointIdsList(
-                points=entity_ids,
+            points_selector=rest.FilterSelector(
+                filter=rest.Filter(
+                    must=[
+                        rest.FieldCondition(
+                            key="sync_id", match=rest.MatchValue(value=str(sync_id))
+                        ),
+                        rest.FieldCondition(key="entity_id", match=rest.MatchAny(any=entity_ids)),
+                    ]
+                )
             ),
             wait=True,  # Wait for operation to complete
         )
@@ -316,7 +336,7 @@ class QdrantDestination(VectorDBDestination):
             # Convert dict filter to Qdrant filter format
             qdrant_filter = rest.Filter.model_validate(filter_condition)
 
-            self.client.delete(
+            await self.client.delete(
                 collection_name=self.collection_name,
                 points_selector=rest.FilterSelector(
                     filter=qdrant_filter,
@@ -341,25 +361,11 @@ class QdrantDestination(VectorDBDestination):
         """
         await self.ensure_client_readiness()
 
-        # Ensure sync_id is a string
-        sync_id_str = str(self.sync_id)
-
-        # Create filter for sync_id
-        filter_condition = {
-            "must": [
-                {"key": "sync_id", "match": {"value": sync_id_str}},
-            ]
-        }
-
         try:
-            # Convert dict filter to Qdrant filter format
-            qdrant_filter = rest.Filter.model_validate(filter_condition)
-
             # Perform search
-            search_results = self.client.search(
+            search_results = await self.client.search(
                 collection_name=self.collection_name,
                 query_vector=query_vector,
-                query_filter=qdrant_filter,
                 limit=10,
                 with_payload=True,
             )
@@ -378,17 +384,4 @@ class QdrantDestination(VectorDBDestination):
             return results
         except Exception as e:
             logger.error(f"Error searching with Qdrant filter: {e}")
-            logger.error(f"Filter condition: {filter_condition}")
             return []
-
-    @staticmethod
-    def _sanitize_collection_name(collection_name: UUID) -> str:
-        """Sanitize the collection name to be a valid Qdrant collection name.
-
-        Args:
-            collection_name (UUID): The collection name to sanitize.
-
-        Returns:
-            str: The sanitized collection name.
-        """
-        return str(collection_name).replace("-", "_")
