@@ -1,4 +1,4 @@
-"""LLM Provider initializer to get LLM client"""
+"""LLM Provider initializer to get LLM client."""
 
 from airweave.core.config import settings
 
@@ -7,7 +7,9 @@ from .openai_client import OpenAIClient
 
 # from .base import BaseLLMClient
 
+
 def get_llm_client():
+    """Get the appropriate LLM client instance based on configured provider."""
     if settings.LLM_PROVIDER.lower() == "ollama":
         return OllamaClient(base_url=settings.OLLAMA_BASE_URL)
     elif settings.LLM_PROVIDER.lower() == "openai":

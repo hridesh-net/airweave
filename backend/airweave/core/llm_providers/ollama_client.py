@@ -1,35 +1,34 @@
-"""Ollama CLient to handle Ollama request"""
+"""Ollama client to handle Ollama request."""
+
+import json
+from typing import AsyncGenerator, Dict, List
 
 import httpx
-import json
-from typing import List, Dict, AsyncGenerator
 from openai.types.chat import ChatCompletionChunk
+
 from .base import BaseLLMClient
 
+
 class OllamaClient(BaseLLMClient):
+    """Client implementation to interact with a local Ollama server."""
+
     def __init__(self, base_url: str = "http://localhost:11434"):
+        """Initialize the Ollama client with a base URL."""
         self.base_url = base_url.rstrip("/")
 
     async def create_completion(
-        self,
-        messages: List[Dict],
-        model: str,
-        stream: bool = False,
-        **kwargs
+        self, messages: List[Dict], model: str, stream: bool = False, **kwargs
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
         """Call Ollama local server to generate completion."""
-        import json
         prompt = "\n".join([msg["content"] for msg in messages if msg["role"] != "system"])
 
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": stream
-        }
+        payload = {"model": model, "prompt": prompt, "stream": stream}
 
         try:
             async with httpx.AsyncClient() as client:
-                async with client.stream("POST", f"{self.base_url}/api/generate", json=payload, timeout=60) as response:
+                async with client.stream(
+                    "POST", f"{self.base_url}/api/generate", json=payload, timeout=60
+                ) as response:
                     async for line in response.aiter_lines():
                         if not line.strip():
                             continue
@@ -41,11 +40,17 @@ class OllamaClient(BaseLLMClient):
                             if content:
                                 yield ChatCompletionChunk.model_construct(
                                     choices=[
-                                        {"delta": {"content": content}, "finish_reason": None, "index": 0}
+                                        {
+                                            "delta": {"content": content},
+                                            "finish_reason": None,
+                                            "index": 0,
+                                        }
                                     ]
                                 )
                         except Exception as parse_error:
-                            raise RuntimeError(f"Failed to parse Ollama response line: {line}") from parse_error
+                            raise RuntimeError(
+                                f"Failed to parse Ollama response line: {line}"
+                            ) from parse_error
 
         except httpx.HTTPStatusError as e:
             raise RuntimeError(f"Ollama returned an error: {e.response.text}") from e

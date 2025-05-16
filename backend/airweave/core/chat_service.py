@@ -4,16 +4,14 @@ import logging
 from typing import AsyncGenerator, Optional
 from uuid import UUID
 
-from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionChunk
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from airweave import crud, schemas
 from airweave.core.config import settings
+from airweave.core.llm_providers import get_llm_client
 from airweave.core.search_service import search_service
 from airweave.models.chat import ChatMessage, ChatRole
-
-from airweave.core.llm_providers import get_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +55,28 @@ class ChatService:
         else:
             self.DEFAULT_MODEL = "gpt-4o"
 
+    async def _get_chat_and_context(
+        self, db: AsyncSession, chat_id: UUID, user: schemas.User
+    ) -> tuple[Optional[schemas.Chat], list[dict]]:
+        chat = await crud.chat.get_with_messages(db=db, id=chat_id, current_user=user)
+        if not chat:
+            logger.error(f"Chat {chat_id} not found")
+            return None, []
+
+        last_user_message = next(
+            (msg for msg in reversed(chat.messages) if msg.role == ChatRole.USER), None
+        )
+        context = ""
+        if last_user_message:
+            context = await self._get_relevant_context(
+                db=db,
+                chat=chat,
+                query=last_user_message.content,
+                user=user,
+            )
+        messages = self._prepare_messages_with_context(chat.messages, context)
+        return chat, messages
+
     async def generate_streaming_response(
         self,
         db: AsyncSession,
@@ -74,62 +94,28 @@ class ChatService:
             AsyncGenerator[ChatCompletionChunk]: Stream of response entities
         """
         try:
-            chat = await crud.chat.get_with_messages(db=db, id=chat_id, current_user=user)
+            chat, messages = await self._get_chat_and_context(db, chat_id, user)
             if not chat:
-                logger.error(f"Chat {chat_id} not found")
                 return
 
-            # Get relevant context from last user message
-            last_user_message = next(
-                (msg for msg in reversed(chat.messages) if msg.role == ChatRole.USER), None
-            )
-            context = ""
-            if last_user_message:
-                context = await self._get_relevant_context(
-                    db=db,
-                    chat=chat,
-                    query=last_user_message.content,
-                    user=user,
-                )
-
-            # Prepare messages with context
-            messages = self._prepare_messages_with_context(chat.messages, context)
-
-            # Merge settings
-            if settings.LLM_PROVIDER.lower() == "ollama":
-                model = self.DEFAULT_MODEL
-            else:
-                model = chat.model_name or self.DEFAULT_MODEL
-            
+            model = chat.model_name or self.DEFAULT_MODEL
             model_settings = {
                 **self.DEFAULT_MODEL_SETTINGS,
-                "stream": True,  # Enable streaming
+                "stream": True,
             }
 
             full_content = ""
-            
-            if settings.LLM_PROVIDER.lower() == "ollama":
-                async for chunk in self.client.create_completion(
-                    model=model,
-                    messages=messages,
-                    **model_settings,
-                ):
-                    if chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        full_content += content
-                        yield chunk
-            else:
-                stream = await self.client.create_completion(
-                    model=model,
-                    messages=messages,
-                    **model_settings,
-                )
-                async for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        full_content += chunk.choices[0].delta.content
-                    yield chunk
+            stream = await self.client.create_completion(
+                model=model,
+                messages=messages,
+                **model_settings,
+            )
 
-            # Save the complete message after streaming
+            async for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    full_content += chunk.choices[0].delta.content
+                yield chunk
+
             if full_content:
                 message_create = schemas.ChatMessageCreate(
                     content=full_content,
@@ -141,7 +127,6 @@ class ChatService:
 
         except Exception as e:
             logger.error(f"Error generating streaming response: {str(e)}")
-            # Create error message
             error_message = schemas.ChatMessageCreate(
                 content=(
                     "Sorry, I encountered an error while generating a response. Please try again."

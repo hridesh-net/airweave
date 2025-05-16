@@ -79,7 +79,7 @@ class Settings(BaseSettings):
 
     OPENAI_API_KEY: Optional[str] = None
     MISTRAL_API_KEY: Optional[str] = None
-    
+
     LLM_PROVIDER: str = "openai"
     OLLAMA_BASE_URL: Optional[str] = None
 
